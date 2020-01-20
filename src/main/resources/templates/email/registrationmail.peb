@@ -1,0 +1,9 @@
+{% extends "base.peb" %}
+
+{% block content %}
+<h1> Welcome {{ name }}! </h1>
+<hr>
+<p>
+    <a href="http://localhost:8787/auth/verify/{{verification_token}}" class="button">Verify Email</a>
+</p>
+{% endblock %}

@@ -1,0 +1,22 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Debug (Launch) - Vertx",
+            "request": "launch",
+            "mainClass": "io.vertx.core.Launcher",
+            "args": "run com.fsbergado.mppeis.MainVerticle -Dvertx.disableFileCaching=true",
+            "env": {
+                "PGPORT": "5432",
+                "PGHOST": "localhost",
+                "PGUSER": "mppeis",
+                "PGDATABASE": "mppeis",
+                "PGPASSWORD": "multigrade"
+            }
+        }
+    ]
+}

@@ -1,27 +1,46 @@
 package com.fsbergado.mppeis;
 
+import java.util.HashSet;
+import java.util.Set;
+
 import com.fsbergado.mppeis.database.DatabaseVerticle;
 import com.fsbergado.mppeis.user.UserServiceVerticle;
+import com.fsbergado.mppeis.utils.RandomString;
 import com.fsbergado.mppeis.utils.Validator;
 
 import at.favre.lib.crypto.bcrypt.BCrypt;
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Handler;
 import io.vertx.core.Promise;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.eventbus.DeliveryOptions;
 import io.vertx.core.eventbus.EventBus;
+import io.vertx.core.http.Cookie;
+import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerOptions;
+import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.PemKeyCertOptions;
 import io.vertx.ext.auth.PubSecKeyOptions;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.jwt.JWTOptions;
+import io.vertx.ext.mail.MailClient;
+import io.vertx.ext.mail.MailConfig;
+import io.vertx.ext.mail.MailMessage;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.common.template.TemplateEngine;
 import io.vertx.ext.web.handler.BodyHandler;
-import io.vertx.ext.web.handler.JWTAuthHandler;
+import io.vertx.ext.web.handler.CSRFHandler;
+import io.vertx.ext.web.handler.CorsHandler;
+import io.vertx.ext.web.handler.LoggerHandler;
+import io.vertx.ext.web.handler.StaticHandler;
+import io.vertx.ext.web.handler.TemplateHandler;
+import io.vertx.ext.web.templ.pebble.PebbleTemplateEngine;
 
 /**
  * HttpServerVerticle
@@ -32,26 +51,41 @@ public class HttpServerVerticle extends AbstractVerticle {
 
     private EventBus eventBus;
 
+    // private JWTOptions jwtOptions;
+
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
         super.start(startPromise);
 
         final Router mainRouter = Router.router(vertx);
-
-        mainRouter.route().consumes(RESPONSE_CONTENT_TYPE);
+        
+        // mainRouter.route().handler(createCorsHandler());
+        mainRouter.route().handler(CSRFHandler.create(RandomString.generate(16)));
         mainRouter.post().handler(BodyHandler.create());
         mainRouter.put().handler(BodyHandler.create());
+        mainRouter.route().handler(LoggerHandler.create());
         mainRouter.route().failureHandler(this::failureHandler);
+
+        final TemplateEngine engine = PebbleTemplateEngine.create(vertx);
+        final TemplateHandler templateHandler = TemplateHandler.create(engine);
+
+        mainRouter.route("/static/*").handler(StaticHandler.create());
+        mainRouter.get("/").handler(templateHandler);
         
         final Router authRouter = Router.router(vertx);
         
+        authRouter.route().consumes("application/json");
         authRouter.post("/register").handler(this::registerHandler).handler(this::finalResponseHandler);
         authRouter.post("/login").handler(this::loginHandler).handler(this::finalResponseHandler);
-        authRouter.get("/me").handler(JWTAuthHandler.create(getAuthProvider())).handler(this::meHandler).handler(this::finalResponseHandler);
+        authRouter.get("/me").handler(this::customJWTAuthHandler).handler(this::meHandler).handler(this::finalResponseHandler);
+        authRouter.get("/verify/:token").handler(this::verifyHandler).handler(this::finalResponseHandler);
         
         mainRouter.mountSubRouter("/auth", authRouter);
 
-        vertx.createHttpServer(new HttpServerOptions().setLogActivity(true)).requestHandler(mainRouter).listen(HTTP_PORT, http -> {
+        final String keyPath = getClass().getClassLoader().getResource("keys/localhost.key").getFile();
+        final String certPath = getClass().getClassLoader().getResource("keys/localhost.crt").getFile();
+
+        vertx.createHttpServer(new HttpServerOptions().setSsl(true).setPemKeyCertOptions(new PemKeyCertOptions().setKeyPath(keyPath).setCertPath(certPath)).setLogActivity(true)).requestHandler(mainRouter).listen(HTTP_PORT, http -> {
             if (http.failed()) {
                 startPromise.fail(http.cause());                
                 http.cause().printStackTrace();
@@ -64,13 +98,76 @@ public class HttpServerVerticle extends AbstractVerticle {
         });
     }
 
+    // CORS Handler
+    private Handler<RoutingContext> createCorsHandler() {
+        final Set<String> allowedHeaders = new HashSet<>();
+        allowedHeaders.add("x-requested-with");
+        allowedHeaders.add("Access-Control-Allow-Origin");
+        allowedHeaders.add("origin");
+        allowedHeaders.add("Content-Type");
+        allowedHeaders.add("accept");
+        allowedHeaders.add("X-XSRF-TOKEN");
+        allowedHeaders.add("Authorization");
+
+        final Set<HttpMethod> allowedMethods = new HashSet<>();
+        allowedMethods.add(HttpMethod.GET);
+        allowedMethods.add(HttpMethod.POST);
+        allowedMethods.add(HttpMethod.OPTIONS);
+        allowedMethods.add(HttpMethod.DELETE);
+        allowedMethods.add(HttpMethod.PATCH);
+        allowedMethods.add(HttpMethod.PUT);
+
+        return CorsHandler.create("*").allowedHeaders(allowedHeaders).allowedMethods(allowedMethods);
+    }
+
+    // Handler that verifies user
+    private void verifyHandler(RoutingContext ctx) {
+
+        final String token = ctx.request().getParam("token");
+        final JsonObject message = new JsonObject().put("token", token);
+        final DeliveryOptions options = new DeliveryOptions().addHeader("action", "verify");
+
+        // Invoke the user service to verify the supplied token
+        eventBus.request(UserServiceVerticle.VERTX_EVENT_BUS_USER_SERVICE_ADDRESS, message, options, reply -> {
+            if (reply.failed()) {
+                ctx.fail(reply.cause());
+                return;
+            }            
+
+            // Get the result
+            final JsonObject result = (JsonObject) reply.result().body();
+
+            // The response payload
+            JsonObject payload = new JsonObject();
+
+            // User with the specified token does not exist, respond with an error
+            if (result.size() == 0) {
+                ctx.put("payload", payload.put("error", "Invalid token."));
+                ctx.response().setStatusCode(400);
+                ctx.next();
+                return;
+            }
+
+            // Token was found, return the user
+            ctx.put("payload", payload.put("user", result.getJsonObject("user")));
+            ctx.next();
+        });
+    }
+
+    // Handler for user registration
     private void registerHandler(RoutingContext ctx) {
         final JsonObject body = ctx.getBodyAsJson();
+        final String name = body.getString("name");
         final String email = body.getString("email");
         final HttpServerResponse response = ctx.response();
         final JsonObject responseBody = new JsonObject();
         final JsonArray errors = new JsonArray();
         boolean hasErrors = false;
+
+        if (name.isEmpty()) {
+            errors.add(new JsonObject().put("field", "name").put("error", "Name is required."));
+            hasErrors = true;            
+        }
 
         if (email.isEmpty()) {
             errors.add(new JsonObject().put("field", "email").put("error", "Email is required."));
@@ -109,7 +206,8 @@ public class HttpServerVerticle extends AbstractVerticle {
             return;
         }
 
-        final JsonObject message = new JsonObject().put("email", body.getString("email")).put("password", password);
+        final String verification_token = RandomString.generate(32);
+        final JsonObject message = new JsonObject().put("name", name).put("email", body.getString("email")).put("password", password).put("verification_token", verification_token);
         final DeliveryOptions options = new DeliveryOptions().addHeader("action", "register");
 
         eventBus.request(UserServiceVerticle.VERTX_EVENT_BUS_USER_SERVICE_ADDRESS, message, options, reply -> {
@@ -117,18 +215,54 @@ public class HttpServerVerticle extends AbstractVerticle {
                 ctx.fail(reply.cause());
                 return;
             }
-            response.setStatusCode(201);
-            ctx.put("payload", reply.result().body());
-            ctx.next();
+
+            final TemplateEngine engine = PebbleTemplateEngine.create(vertx);
+            final JsonObject context = new JsonObject().put("name", name).put("verification_token", verification_token);
+            final String template = getClass().getClassLoader().getResource("templates/email/registrationmail.peb").getFile();
+
+            engine.render(context, template, ar -> {
+                if (ar.failed()) {
+                    ctx.fail(ar.cause());
+                    return;
+                }
+
+                final Buffer buf = ar.result();
+                
+                final MailConfig config = new MailConfig();
+                config.setHostname("localhost");
+                config.setPort(1025);
+                // config.setStarttls(StartTLSOptions.REQUIRED);
+                config.setUsername("");
+                config.setPassword("");
+                final MailClient mailClient = MailClient.createNonShared(vertx, config);
+    
+                final MailMessage mail = new MailMessage();
+                mail.setFrom("mppeis@mppeis.net (Admin User)");
+                mail.setTo(email);
+                // mail.setText("this is the plain message text");
+                mail.setHtml(buf.toString());
+    
+                mailClient.sendMail(mail, ar2 -> {
+                    if (ar2.failed()) {
+                        ctx.fail(ar2.cause());
+                        return;
+                    }
+                    response.setStatusCode(201);
+                    ctx.put("payload", reply.result().body());
+                    ctx.next();
+                });
+            });
         });
     }
 
+    // User login handler
     private void loginHandler(RoutingContext ctx) {
         final JsonObject body = ctx.getBodyAsJson();
         final String email = body.getString("email");
         final JsonArray errors = new JsonArray();
         boolean hasErrors = false;
 
+        // Validate input
         if (email.isEmpty()) {
             errors.add(new JsonObject().put("field", "email").put("error", "Email is required."));
             hasErrors = true;
@@ -157,12 +291,13 @@ public class HttpServerVerticle extends AbstractVerticle {
             return;
         }            
 
-        final String SQL_FIND_USER_BY_EMAIL = "SELECT password, role FROM users WHERE email = $1";
+        final String SQL_FIND_USER_BY_EMAIL = "SELECT id, name, email, password, role, is_active, email_verified_at FROM users WHERE email = $1";
         final JsonObject payload = new JsonObject().put("query", SQL_FIND_USER_BY_EMAIL).put("params",
                 new JsonArray().add(email));
         final DeliveryOptions options = new DeliveryOptions().addHeader("action", "prepared-query");
         final String ERROR = "Invalid username or password.";        
 
+        // Query the database for a user with the specified email
         eventBus.request(DatabaseVerticle.VERTX_EVENT_BUS_DATABASE_SERVICE_ADDRESS, payload, options, reply -> {
             if (reply.failed()) {
                 ctx.fail(reply.cause());
@@ -172,14 +307,35 @@ public class HttpServerVerticle extends AbstractVerticle {
             final JsonObject body2 = (JsonObject) reply.result().body();
             final JsonArray result = body2.getJsonArray("result");
 
-            if (result.isEmpty()) {
+            // Get the query result
+            final JsonObject user = (JsonObject) result.iterator().next();
+
+            if (user.isEmpty()) {
                 response.setStatusCode(401);
                 ctx.put("payload", new JsonObject().put("error", ERROR));
                 ctx.next();
                 return;
             }
 
-            final JsonObject user = (JsonObject) result.iterator().next();
+            // The user hasn't verified his/her email
+            if (null == user.getString("email_verified_at")) {
+                response.setStatusCode(401);
+                ctx.put("payload", new JsonObject().put("error", "Please verify your email."));
+                ctx.next();
+                return;                
+            }
+
+            final Boolean active = user.getBoolean("is_active");
+
+            // The user account is not active
+            if (!active) {
+                response.setStatusCode(401);
+                ctx.put("payload", new JsonObject().put("error", "Your account is deactivated."));
+                ctx.next();
+                return;
+            }
+
+            // Check if the supplied password matches the hashed password stored in the database
             final String hashed = user.getString("password");
             final BCrypt.Result bcrypt = BCrypt.verifyer().verify(password.toCharArray(), hashed);
 
@@ -190,16 +346,59 @@ public class HttpServerVerticle extends AbstractVerticle {
                 return;
             }
 
-            final String token = getAuthProvider().generateToken(new JsonObject().put("user", email).put("role", user.getInteger("role")), new JWTOptions().setAlgorithm("RS256").setSubject("MPPEIS API").setIssuer("MPPEIS"));
+            // Passwords match, generate the access token            
+            // final List<String> audience = new ArrayList<>();
+            // audience.add("http://localhost:" + HTTP_PORT);
 
-            ctx.put("payload", new JsonObject().put("access_token", token));
+            final JsonObject payload2 = new JsonObject().put("id", user.getInteger("id")).put("name", user.getString("name")).put("role", user.getInteger("role"));
+
+            final String token = getAuthProvider().generateToken(payload2, new JWTOptions().setAlgorithm("RS256"));
+
+            // Split the jwt token into two cookies to enhance api security
+            final String[] jwt = token.split("\\.");
+            final Cookie jwt1 = Cookie.cookie("session", String.join(".", jwt[0], jwt[1])).setSecure(true).setMaxAge(60 * 30);
+            final Cookie jwt2 = Cookie.cookie("mppeis", jwt[2]).setSecure(true).setHttpOnly(true).setMaxAge(Long.MIN_VALUE);
+            ctx.response().addCookie(jwt1).addCookie(jwt2);
+            ctx.put("payload", new JsonObject().put("user", payload2));
             ctx.next();
         });
     }
 
+    // Custom handler to authenticate the split jwt token
+    private void customJWTAuthHandler(RoutingContext ctx) {
+
+        final HttpServerRequest request = ctx.request();
+        final Cookie jwt1 = request.getCookie("session");
+        final Cookie jwt2 = request.getCookie("mppeis");
+        final String header = request.getHeader("X-Requested-With");
+        final String jwtPayload1 = jwt1.getValue();
+        final String jwtPayload2 = jwt2.getValue();
+
+        if (null != jwtPayload1 && !jwtPayload1.isEmpty() && null != jwtPayload2 && !jwtPayload2.isEmpty() && header.equals("XMLHttpRequest")) {
+            final String jwt = String.join(".", jwtPayload1, jwtPayload2);
+            final JsonObject authInfo = new JsonObject().put("jwt", jwt);
+            getAuthProvider().authenticate(authInfo, authResult -> {
+                if (authResult.failed()) {
+                    ctx.fail(authResult.cause());
+                    return;
+                }
+
+                // Set the logged in user
+                ctx.setUser(authResult.result());
+
+                // Generate a new cookie payload with fresh expiration time
+                ctx.response().addCookie(jwt1.setMaxAge(60 * 30));
+                ctx.next();
+            });
+        } else {
+            ctx.fail(401);
+        }
+    }
+
     private void meHandler(RoutingContext ctx) {
         final JsonObject principal = ctx.user().principal();
-        ctx.put("payload", new JsonObject().put("user", principal.getString("user")).put("role", principal.getInteger("role")));
+        final JsonObject user = new JsonObject().put("id", principal.getInteger("id")).put("name", principal.getString("name")).put("email", principal.getString("email")).put("role", principal.getInteger("role"));
+        ctx.put("payload", new JsonObject().put("user", user));
         ctx.next();
     }
 
@@ -246,6 +445,9 @@ public class HttpServerVerticle extends AbstractVerticle {
         response.putHeader("X-XSS-Protection", "1; mode=block");
         response.putHeader("X-Content-Type-Options", "nosniff");
         response.putHeader("Content-Type", "application/json");
+        response.putHeader("Content-Security-Policy", "script-src 'self'");
+        response.putHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+        response.putHeader("Feature-Policy", "autoplay 'none'; camera 'none'");
         return ctx;
     }
 
@@ -254,6 +456,12 @@ public class HttpServerVerticle extends AbstractVerticle {
         final HttpServerResponse response = ctx.response();
         if (failure.getMessage().equals("Unauthorized")) {
             response.setStatusCode(401);
+        }
+        if (failure.getMessage().equals("Forbidden")) {
+            response.setStatusCode(403);
+        }        
+        if (response.getStatusCode() == 200) {
+            response.setStatusCode(500);
         }
         failure.printStackTrace();
         final JsonObject payload = new JsonObject().put("error", failure.getMessage());
