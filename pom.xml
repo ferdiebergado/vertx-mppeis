@@ -19,9 +19,7 @@
 		<favre-bcrypt.version>
 			0.9.0
 		</favre-bcrypt.version>
-		<logback-classic.version>
-			1.2.3
-		</logback-classic.version>
+		<logback-classic.version>1.2.4</logback-classic.version>
 		<maven.compiler.source>
 			1.8
 		</maven.compiler.source>
